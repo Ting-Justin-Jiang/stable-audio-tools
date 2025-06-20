@@ -146,7 +146,7 @@ def main():
         })
 
     trainer = pl.Trainer(
-        devices="auto",
+        devices=[0],
         accelerator="gpu",
         num_nodes = args.num_nodes,
         strategy=strategy,

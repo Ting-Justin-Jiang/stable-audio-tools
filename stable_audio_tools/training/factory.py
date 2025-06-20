@@ -112,6 +112,33 @@ def create_training_wrapper_from_config(model_config, model):
                 inpainting_config=training_config.get("inpainting", None)
             )
 
+        elif "ect" in training_config:
+            from .ect import ECTTrainingWrapper
+            ect_config = training_config["ect"]
+
+            return ECTTrainingWrapper(
+                model,
+                lr=training_config.get("learning_rate", None),
+                mask_padding=training_config.get("mask_padding", False),
+                mask_padding_dropout=training_config.get("mask_padding_dropout", 0.0),
+                use_ema=training_config.get("use_ema", True),
+                log_loss_info=training_config.get("log_loss_info", False),
+                optimizer_configs=training_config.get("optimizer_configs", None),
+                pre_encoded=training_config.get("pre_encoded", False),
+                cfg_dropout_prob=training_config.get("cfg_dropout_prob", 0.1),
+
+                mapping_q=ect_config.get("mapping_q", 8.0),
+                mapping_k=ect_config.get("mapping_k", 8.0),
+                mapping_b=ect_config.get("mapping_b", 1.0),
+                mapping_d=ect_config.get("mapping_d", 20000),
+                min_sigma=ect_config.get("min_sigma", 1e-4),
+                max_sigma=ect_config.get("max_sigma", 1.0),
+                timestep_dist= ect_config.get("timestep_dist", "lognormal"),
+                t_log_mean= ect_config.get("t_log_mean", -1.1),
+                t_log_std = ect_config.get("t_log_std", 2.0)
+            )
+
+
         from .diffusion import DiffusionCondTrainingWrapper
         return DiffusionCondTrainingWrapper(
             model, 
