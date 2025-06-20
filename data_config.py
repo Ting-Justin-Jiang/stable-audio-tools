@@ -35,33 +35,42 @@ def prompt_from_rel(rel: Path, prefix: str, exclude: set,
     return f"{prefix}, {body}" if prefix and body else prefix or body
 
 
-def build_metadata_py(path: Path, prefix: str, exclude: set,
-                      drop_first: bool, pack_kw: str) -> None:
+def build_metadata_py(path: Path,
+                      prefix: str,
+                      exclude: set,
+                      drop_first: bool,
+                      pack_kw: str) -> None:
     """
-    This function generates a data config for training/finetuning.
+    Write the custom_metadata.py used by stable-audio-tools.
     """
     code = (
         "import pathlib, re, json\n"
-        f"prefix={json.dumps(prefix)}\n"
-        f"exclude=set({json.dumps(list(exclude))})\n"
-        f"drop_first={json.dumps(drop_first)}\n"
-        f"pack_kw={json.dumps(pack_kw)}\n"
-        "_clean=lambda t:re.sub(r'\\d+','',t).replace('_',' ').replace('-',' ').strip()\n"
-        "_pat=re.compile(r'(?i)'+re.escape(pack_kw).replace(r'\\-','[- ]?'))\n"
-        "_strip=lambda txt:_pat.sub('',txt)\n"
-        "def get_custom_metadata(info,_):\n"
-        " p=pathlib.Path(info['relpath']);parts=p.with_suffix('').parts;t=[]\n"
-        " if parts and pack_kw.lower() in parts[0].lower():\n"
-        "  q=_clean(_strip(parts[0]));\n"
-        "  if q and q.lower() not in exclude:t.append(q)\n"
-        " for i,part in enumerate(parts[1:]):\n"
-        "  if part.lower()=='samples':continue\n"
-        "  q=_clean(part)\n"
-        "  if i==len(parts[1:])-1 and drop_first:\n"
-        "   w=q.split();q=' '.join(w[1:]) if len(w)>1 else ''\n"
-        "  if q and q.lower() not in exclude:t.append(q)\n"
-        " body=', '.join(t)\n"
-        " return {'prompt': f'{prefix}, {body}' if prefix and body else prefix or body}\n"
+        f"prefix = {json.dumps(prefix)}\n"
+        f"exclude = set({json.dumps(list(exclude))})\n"
+        f"drop_first = {drop_first}\n"          # <-- use Python bool, *not* JSON
+        f"pack_kw = {json.dumps(pack_kw)}\n"
+        "_clean = lambda t: re.sub(r'\\d+', '', t).replace('_', ' ').replace('-', ' ').strip()\n"
+        "_pat   = re.compile(r'(?i)' + re.escape(pack_kw).replace(r'\\-', '[- ]?'))\n"
+        "_strip = lambda txt: _pat.sub('', txt)\n"
+        "def get_custom_metadata(info, _):\n"
+        "    rel = pathlib.Path(info['relpath'])\n"
+        "    parts = rel.with_suffix('').parts\n"
+        "    toks = []\n"
+        "    if parts and pack_kw.lower() in parts[0].lower():\n"
+        "        q = _clean(_strip(parts[0]))\n"
+        "        if q and q.lower() not in exclude:\n"
+        "            toks.append(q)\n"
+        "    for i, part in enumerate(parts[1:]):\n"
+        "        if part.lower() == 'samples':\n"
+        "            continue\n"
+        "        q = _clean(part)\n"
+        "        if i == len(parts[1:]) - 1 and drop_first:\n"
+        "            w = q.split()\n"
+        "            q = ' '.join(w[1:]) if len(w) > 1 else ''\n"
+        "        if q and q.lower() not in exclude:\n"
+        "            toks.append(q)\n"
+        "    body = ', '.join(toks)\n"
+        "    return {'prompt': f'{prefix}, {body}' if prefix and body else prefix or body}\n"
     )
     path.write_text(code)
 

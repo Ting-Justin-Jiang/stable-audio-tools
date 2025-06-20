@@ -160,7 +160,7 @@ def main(args):
 
     trainer = pl.Trainer(
         accelerator="gpu",
-        devices="auto",
+        devices=[0],
         num_nodes = args.num_nodes,
         strategy=args.strategy,
         precision="16-true" if args.model_half else "32",
