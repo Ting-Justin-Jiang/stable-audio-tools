@@ -9,7 +9,10 @@ from time import time
 
 from ..models.diffusion import ConditionedDiffusionModelWrapper
 from ..inference.sampling import get_alphas_sigmas
+from .losses import MSELoss, MultiLoss
 from .utils import create_optimizer_from_config, create_scheduler_from_config
+
+DEBUG = False
 
 
 class Profiler:
@@ -33,13 +36,7 @@ class ECTTrainingWrapper(pl.LightningModule):
     """
     Easy Consistency Tuning (ECT) training loop for conditional audio diffusion.
 
-    The training objective is
-
-        L = w(t,r) ‖f(x_t,t) - sg[f(x_r,r)]‖²
-
-    where (t,r) is a pair of noise levels with r<t, sg is the stop‑gradient
-    operator, and w(t,r) combines the 1/(t−r) timestep weight with an adaptive
-    Charbonnier term on the prediction residual.
+    The training objective is L = w(t,r) ‖f(x_t,t) - sg[f(x_r,r)]‖²
     """
 
     def __init__(
@@ -58,9 +55,9 @@ class ECTTrainingWrapper(pl.LightningModule):
             mapping_q: float = 8.0,
             mapping_k: float = 8.0,
             mapping_b: float = 1.0,
-            mapping_d: int = 20000,
+            mapping_d: int = 15000,
             min_sigma: float = 1e-4,
-            max_sigma: float = 1.0,
+            max_sigma: float = 30,
             timestep_dist: tp.Literal["lognormal", "uniform"] = "lognormal",
             t_log_mean: float = -1.1,
             t_log_std: float = 2.0,
@@ -103,7 +100,6 @@ class ECTTrainingWrapper(pl.LightningModule):
 
         # loss
         self.diffusion_objective = model.diffusion_objective
-        self.loss_fn = torch.nn.MSELoss(reduction="none")
         self.log_loss_info = log_loss_info
 
         # optimizer
@@ -119,7 +115,6 @@ class ECTTrainingWrapper(pl.LightningModule):
         self.pre_encoded = pre_encoded
 
     def configure_optimizers(self):
-        # TODO: Sanity check on this function
         diffusion_opt_config = self.optimizer_configs['diffusion']
         opt_diff = create_optimizer_from_config(diffusion_opt_config['optimizer'], self.diffusion.parameters())
         if "scheduler" in diffusion_opt_config:
@@ -132,12 +127,13 @@ class ECTTrainingWrapper(pl.LightningModule):
         return [opt_diff]
 
     def sample_t(self, batch: int, device: torch.device) -> torch.Tensor:
-        """Sample timesteps t (~ noise levels σ) in (0, 1]."""
+        """Sample timesteps t (~ noise levels σ)."""
         if self.timestep_dist == "lognormal":
             ln_t = torch.randn(batch, device=device) * self.t_log_std + self.t_log_mean
-            t = ln_t.exp().clamp(self.min_sigma, self.max_sigma)
+            t = ln_t.exp().clamp(min=self.min_sigma)
         else:  # uniform
             t = torch.rand(batch, device=device) * (self.max_sigma - self.min_sigma) + self.min_sigma
+        if DEBUG: print(f"sample t: {t} at iteration {self.iter_counter}")
         return t
 
     def sample_r(self, t: torch.Tensor) -> torch.Tensor:
@@ -146,7 +142,9 @@ class ECTTrainingWrapper(pl.LightningModule):
         n_t = 1.0 + self.k * torch.sigmoid(-self.b * t)
         ratio = 1.0 - torch.pow(self.q, -a * n_t)
         r = ratio * t
-        return r.clamp(min=self.min_sigma)
+        r = r.clamp(min=self.min_sigma)
+        if DEBUG: print(f"sample r: {r} at iteration {self.iter_counter}")
+        return r
 
     def sigma_to_tau(self, sigma: torch.Tensor) -> torch.Tensor:
         return (2 / torch.pi) * torch.atan(sigma)
@@ -182,8 +180,8 @@ class ECTTrainingWrapper(pl.LightningModule):
 
         # conditioning
         cond = self.diffusion.conditioner(metadata, self.device)
-
-        if self.mask_padding and random.random() > self.mask_padding_dropout:
+        use_padding_mask = self.mask_padding and random.random() > self.mask_padding_dropout
+        if use_padding_mask:
             pad_masks = torch.stack([md["padding_mask"] for md in metadata], dim=0).to(self.device)
             extra_args = {"mask": pad_masks}
         else:
@@ -193,8 +191,12 @@ class ECTTrainingWrapper(pl.LightningModule):
 
         # sample t & r
         t_sigma = self.sample_t(x0.shape[0], self.device)
-        r_sigma = self.sample_r(t_sigma)
+        r_sigma = self.sample_r(t_sigma) # ratio is r/t
         t, r = self.sigma_to_tau(t_sigma), self.sigma_to_tau(r_sigma) # snr -> angle
+
+        if DEBUG:
+            print(f"convert t to angle time tau_t: {t}")
+            print(f"convert r to angle time tau_r: {r}")
 
         # add noise
         eps = torch.randn_like(x0)
@@ -229,17 +231,24 @@ class ECTTrainingWrapper(pl.LightningModule):
         else:
             raise NotImplementedError
 
+        if DEBUG:
+            with torch.no_grad():
+                mse_r = torch.mean((x0_pred_r - x0) ** 2)
+                print(f"Boundary condition mapping error: {mse_r}")
         p.tick("forward")
 
         # loss
         delta = x0_pred_t - x0_pred_r
 
         # Charbonnier‑style adaptive weight to stabilise gradients (Eq. 16)
-        adaptive = 1.0 / torch.sqrt(delta.pow(2).mean(dim=tuple(range(1, delta.ndim))) + 1e-5)
+        adaptive = 1.0 / torch.sqrt(delta.pow(2).mean(dim=tuple(range(1, delta.ndim))) + 1e-5)  # c is just for mitigating numerical division
         timestep_w = 1.0 / (t_sigma - r_sigma + 1e-8)
         w = (adaptive * timestep_w)[:, None, None]  # broadcast to match delta dims
 
         loss = (w * delta.pow(2)).mean()
+        if DEBUG:
+            print(f"Weight: {w}")
+
         p.tick("loss")
 
         log_dict = {

@@ -1,123 +1,275 @@
-import argparse, json, re, sys
+"""
+Dataset configuration generator for stable-audio-tools.
+
+This script generates dataset configuration files and metadata extraction modules
+for training stable-audio-tools models from local audio files.
+"""
+import argparse
+import json
+import re
+import sys
 from pathlib import Path
+from typing import List, Set, Dict, Any
 
 
-def _clean(t: str) -> str:
-    return re.sub(r"\d+", "", t).replace("_", " ").replace("-", " ").strip()
+def _clean_text(text: str) -> str:
+    """Clean text by replacing underscores and hyphens with spaces."""
+    return text.replace("_", " ").replace("-", " ").strip()
 
 
-def _strip_kw(text: str, kw: str) -> str:
-    pat = re.compile(r"(?i)" + re.escape(kw).replace(r"\-", "[- ]?"))
-    return pat.sub("", text)
+def _strip_keyword(text: str, keyword: str) -> str:
+    """Remove keyword from text using case-insensitive regex."""
+    pattern = re.compile(r"(?i)" + re.escape(keyword).replace(r"\-", "[- ]?"))
+    return pattern.sub("", text)
 
 
-def prompt_from_rel(rel: Path, prefix: str, exclude: set,
-                    drop_first: bool, pack_kw: str) -> str:
-    parts = rel.with_suffix("").parts
-    toks = []
+def prompt_from_path(relative_path: Path, 
+                     prefix: str, 
+                     exclude_words: Set[str],
+                     drop_first_word: bool, 
+                     pack_keyword: str) -> str:
+    """
+    Generate prompt from file path structure.
+    
+    Args:
+        relative_path: Path relative to dataset root
+        prefix: Prefix to add to prompt
+        exclude_words: Set of words to exclude from prompt
+        drop_first_word: Whether to drop first word from filename
+        pack_keyword: Keyword that identifies sample pack folders
+    
+    Returns:
+        Generated prompt string
+    """
+    parts = relative_path.with_suffix("").parts
+    tokens = []
 
-    if parts and pack_kw.lower() in parts[0].lower():
-        p = _clean(_strip_kw(parts[0], pack_kw))
-        if p and p.lower() not in exclude:
-            toks.append(p)
+    # Handle pack keyword in first part
+    if parts and pack_keyword.lower() in parts[0].lower():
+        cleaned_part = _clean_text(_strip_keyword(parts[0], pack_keyword))
+        if cleaned_part and cleaned_part.lower() not in exclude_words:
+            tokens.append(cleaned_part)
 
+    # Process remaining parts
     for idx, part in enumerate(parts[1:]):
         if part.lower() == "samples":
             continue
-        p = _clean(part)
-        if idx == len(parts[1:]) - 1 and drop_first:          # file name
-            w = p.split()
-            p = " ".join(w[1:]) if len(w) > 1 else ""
-        if p and p.lower() not in exclude:
-            toks.append(p)
+            
+        cleaned_part = _clean_text(part)
+        
+        # Handle filename (last part)
+        if idx == len(parts[1:]) - 1 and drop_first_word:
+            words = cleaned_part.split()
+            cleaned_part = " ".join(words[1:]) if len(words) > 1 else ""
+        
+        if cleaned_part and cleaned_part.lower() not in exclude_words:
+            tokens.append(cleaned_part)
 
-    body = ", ".join(toks)
+    body = ", ".join(tokens)
     return f"{prefix}, {body}" if prefix and body else prefix or body
 
 
-def build_metadata_py(path: Path,
+def generate_metadata_module(output_path: Path,
                       prefix: str,
-                      exclude: set,
-                      drop_first: bool,
-                      pack_kw: str) -> None:
+                             exclude_words: Set[str],
+                             drop_first_word: bool,
+                             pack_keyword: str) -> None:
     """
-    Write the custom_metadata.py used by stable-audio-tools.
+    Generate custom metadata module for stable-audio-tools.
+    
+    Args:
+        output_path: Path to write the metadata module
+        prefix: Prefix for prompts
+        exclude_words: Words to exclude from prompts
+        drop_first_word: Whether to drop first word from filenames
+        pack_keyword: Keyword identifying sample pack folders
     """
-    code = (
-        "import pathlib, re, json\n"
-        f"prefix = {json.dumps(prefix)}\n"
-        f"exclude = set({json.dumps(list(exclude))})\n"
-        f"drop_first = {drop_first}\n"          # <-- use Python bool, *not* JSON
-        f"pack_kw = {json.dumps(pack_kw)}\n"
-        "_clean = lambda t: re.sub(r'\\d+', '', t).replace('_', ' ').replace('-', ' ').strip()\n"
-        "_pat   = re.compile(r'(?i)' + re.escape(pack_kw).replace(r'\\-', '[- ]?'))\n"
-        "_strip = lambda txt: _pat.sub('', txt)\n"
-        "def get_custom_metadata(info, _):\n"
-        "    rel = pathlib.Path(info['relpath'])\n"
-        "    parts = rel.with_suffix('').parts\n"
-        "    toks = []\n"
-        "    if parts and pack_kw.lower() in parts[0].lower():\n"
-        "        q = _clean(_strip(parts[0]))\n"
-        "        if q and q.lower() not in exclude:\n"
-        "            toks.append(q)\n"
-        "    for i, part in enumerate(parts[1:]):\n"
-        "        if part.lower() == 'samples':\n"
-        "            continue\n"
-        "        q = _clean(part)\n"
-        "        if i == len(parts[1:]) - 1 and drop_first:\n"
-        "            w = q.split()\n"
-        "            q = ' '.join(w[1:]) if len(w) > 1 else ''\n"
-        "        if q and q.lower() not in exclude:\n"
-        "            toks.append(q)\n"
-        "    body = ', '.join(toks)\n"
-        "    return {'prompt': f'{prefix}, {body}' if prefix and body else prefix or body}\n"
-    )
-    path.write_text(code)
+    code = f'''import pathlib
+import re
+import json
+from typing import Dict, Any, Optional
+
+# Configuration
+prefix = {json.dumps(prefix)}
+exclude = set({json.dumps(list(exclude_words))})
+drop_first = {drop_first_word}
+pack_kw = {json.dumps(pack_keyword)}
+
+# Helper functions
+_clean = lambda t: t.replace('_', ' ').replace('-', ' ').strip()
+_pat = re.compile(r'(?i)' + re.escape(pack_kw).replace(r'\\-', '[- ]?'))
+_strip = lambda txt: _pat.sub('', txt)
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset_dir", default="./stable_audio_tools/data/local/finetune_data")
-    ap.add_argument("--out_base", default="./stable_audio_tools/data/local/dataset_cfg")
-    ap.add_argument("--prefix", default="8-bit, Game Sound")
-    ap.add_argument("--pack_kw", default="8-bit", help="keyword that marks a sample-pack folder")
-    ap.add_argument("--exclude", default="", help="comma-separated words to drop")
-    ap.add_argument("--drop_first", action="store_true", default=True, help="drop first word of file names")
-    ap.add_argument("--test", type=int, default=0, help="print N prompts then exit")
-    args = ap.parse_args()
+def get_custom_metadata(info: Dict[str, Any], _: Optional[Any] = None) -> Dict[str, str]:
+    """Generate metadata for audio file based on path structure."""
+    rel_path = pathlib.Path(info['relpath'])
+    parts = rel_path.with_suffix('').parts
+    tokens = []
+    
+    # Handle pack keyword in first part
+    if parts and pack_kw.lower() in parts[0].lower():
+        cleaned = _clean(_strip(parts[0]))
+        if cleaned and cleaned.lower() not in exclude:
+            tokens.append(cleaned)
+    
+    # Process remaining parts
+    for i, part in enumerate(parts[1:]):
+        if part.lower() == 'samples':
+            continue
+        
+        cleaned = _clean(part)
+        
+        # Handle filename (last part)
+        if i == len(parts[1:]) - 1 and drop_first:
+            words = cleaned.split()
+            cleaned = ' '.join(words[1:]) if len(words) > 1 else ''
+        
+        if cleaned and cleaned.lower() not in exclude:
+            tokens.append(cleaned)
+    
+    body = ', '.join(tokens)
+    prompt = f'{{prefix}}, {{body}}' if prefix and body else prefix or body
+    
+    return {{'prompt': prompt}}
+'''
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(code)
 
-    root = Path(args.dataset_dir).expanduser().resolve()
-    wavs = list(root.rglob("*.wav"))
-    if not wavs:
-        sys.exit("no .wav files found")
 
-    exclude = {w.strip().lower() for w in args.exclude.split(",") if w.strip()}
+def find_audio_files(root_dir: Path) -> List[Path]:
+    """Find all .wav files in directory tree."""
+    if not root_dir.exists():
+        raise FileNotFoundError(f"Dataset directory not found: {root_dir}")
+    
+    wav_files = list(root_dir.rglob("*.wav"))
+    if not wav_files:
+        raise ValueError(f"No .wav files found in {root_dir}")
+    
+    return wav_files
 
-    if args.test:
-        for p in wavs[:args.test]:
-            print(p.relative_to(root), "->",
-                  prompt_from_rel(p.relative_to(root), args.prefix,
-                                  exclude, args.drop_first, args.pack_kw))
-        return
 
-    out_base = Path(args.out_base).expanduser().resolve()
-    out_base.parent.mkdir(parents=True, exist_ok=True)
-    meta_py  = out_base.with_suffix(".metadata.py")
-    cfg_json = out_base.with_suffix(".json")
-
-    build_metadata_py(meta_py, args.prefix.strip(),
-                      exclude, args.drop_first, args.pack_kw)
-
-    cfg = {
+def generate_dataset_config(output_path: Path,
+                           dataset_dir: Path,
+                           metadata_module_path: Path) -> None:
+    """Generate dataset configuration JSON file."""
+    config = {
         "dataset_type": "audio_dir",
         "datasets": [{
-            "id": root.stem,
-            "path": str(root),
-            "custom_metadata_module": str(meta_py)
+            "id": dataset_dir.name,
+            "path": str(dataset_dir),
+            "custom_metadata_module": str(metadata_module_path)
         }],
         "random_crop": True
     }
-    cfg_json.write_text(json.dumps(cfg, indent=2))
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(config, indent=2))
+
+
+def test_prompt_generation(wav_files: List[Path], 
+                          root_dir: Path,
+                          prefix: str,
+                          exclude_words: Set[str],
+                          drop_first_word: bool,
+                          pack_keyword: str,
+                          max_samples: int = 10) -> None:
+    """Test prompt generation on sample files."""
+    print(f"Testing prompt generation on {min(len(wav_files), max_samples)} samples:")
+    print("-" * 80)
+    
+    for wav_file in wav_files[:max_samples]:
+        relative_path = wav_file.relative_to(root_dir)
+        prompt = prompt_from_path(relative_path, prefix, exclude_words, drop_first_word, pack_keyword)
+        print(f"{relative_path}")
+        print(f"  -> '{prompt}'")
+        print()
+
+
+def main() -> None:
+    """Main function."""
+    parser = argparse.ArgumentParser(
+        description="Generate dataset configuration for stable-audio-tools training"
+    )
+    parser.add_argument(
+        "--dataset-dir", 
+        default="./stable_audio_tools/data/local/finetune_data",
+        help="Directory containing audio files"
+    )
+    parser.add_argument(
+        "--out-base", 
+        default="./stable_audio_tools/data/local/dataset_cfg",
+        help="Base path for output files (without extension)"
+    )
+    parser.add_argument(
+        "--prefix", 
+        default="Lo-Fi, instrumental loop, chill",
+        help="Prefix to add to all prompts"
+    )
+    parser.add_argument(
+        "--pack-kw", 
+        default="Inst",
+        help="Keyword that identifies sample pack folders"
+    )
+    parser.add_argument(
+        "--exclude", 
+        default="Cymatics",
+        help="Comma-separated words to exclude from prompts"
+    )
+    parser.add_argument(
+        "--drop-first", 
+        action="store_true", 
+        default=True,
+        help="Drop first word from file names"
+    )
+    parser.add_argument(
+        "--test", 
+        type=int, 
+        default=0,
+        help="Test prompt generation on N samples and exit (0 to disable)"
+    )
+    
+    args = parser.parse_args()
+
+    # Setup paths
+    dataset_dir = Path(args.dataset_dir).expanduser().resolve()
+    output_base = Path(args.out_base).expanduser().resolve()
+    metadata_module_path = output_base.with_suffix(".metadata.py")
+    config_json_path = output_base.with_suffix(".json")
+    
+    # Parse exclude words
+    exclude_words = {word.strip().lower() for word in args.exclude.split(",") if word.strip()}
+    
+    # Find audio files
+    try:
+        wav_files = find_audio_files(dataset_dir)
+        print(f"Found {len(wav_files)} .wav files in {dataset_dir}")
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Test mode
+    if args.test > 0:
+        test_prompt_generation(
+            wav_files, dataset_dir, args.prefix.strip(), exclude_words, 
+            args.drop_first, args.pack_kw, args.test
+        )
+        return
+    
+    # Generate files
+    print("Generating metadata module...")
+    generate_metadata_module(
+        metadata_module_path, args.prefix.strip(), exclude_words, 
+        args.drop_first, args.pack_kw
+    )
+    
+    print("Generating dataset configuration...")
+    generate_dataset_config(config_json_path, dataset_dir, metadata_module_path)
+    
+    print(f"Generated files:")
+    print(f"  Metadata module: {metadata_module_path}")
+    print(f"  Dataset config:  {config_json_path}")
 
 
 if __name__ == "__main__":
