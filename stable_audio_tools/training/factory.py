@@ -127,15 +127,45 @@ def create_training_wrapper_from_config(model_config, model):
                 pre_encoded=training_config.get("pre_encoded", False),
                 cfg_dropout_prob=training_config.get("cfg_dropout_prob", 0.1),
 
+                # ECT parameters
                 mapping_q=ect_config.get("mapping_q", 8.0),
                 mapping_k=ect_config.get("mapping_k", 8.0),
                 mapping_b=ect_config.get("mapping_b", 1.0),
                 mapping_d=ect_config.get("mapping_d", 20000),
                 min_sigma=ect_config.get("min_sigma", 1e-4),
                 max_sigma=ect_config.get("max_sigma", 1.0),
-                timestep_dist= ect_config.get("timestep_dist", "lognormal"),
-                t_log_mean= ect_config.get("t_log_mean", -1.1),
-                t_log_std = ect_config.get("t_log_std", 2.0)
+                timestep_dist=ect_config.get("timestep_dist", "lognormal"),
+                t_log_mean=ect_config.get("t_log_mean", -1.1),
+                t_log_std=ect_config.get("t_log_std", 2.0),
+                
+                # SRA parameters
+                use_sra=ect_config.get("use_sra", False),
+                sra_lambda=ect_config.get("sra_lambda", 1.0),
+                sra_student_layer=ect_config.get("sra_student_layer", 8),
+                sra_teacher_layer=ect_config.get("sra_teacher_layer", 14),
+                sra_max_time_interval=ect_config.get("sra_max_time_interval", 0.5)
+            )
+
+        elif "a2ct" in training_config:
+            from .a2ct import A2CTTrainingWrapper
+            a2ct_cfg = training_config["a2ct"]
+
+            return A2CTTrainingWrapper(
+                model=model,
+                lr=training_config.get("learning_rate", None),
+                optimizer_configs=training_config.get("optimizer_configs", None),
+                discrete_tau=a2ct_cfg.get("discrete_tau", [0.1, 0.6]),
+                tau_grid_from_solver=a2ct_cfg.get("tau_grid_from_solver", None),
+                pair_sampler=a2ct_cfg.get("pair_sampler", {}),
+                gate=a2ct_cfg.get("gate", {}),
+                charbonnier=a2ct_cfg.get("charbonnier", {}),
+                sra=a2ct_cfg.get("sra", {}),
+                prox=a2ct_cfg.get("prox", {}),
+                ema=a2ct_cfg.get("ema", {}),
+                cfg_dropout_prob=training_config.get("cfg_dropout_prob", 0.0),
+                mask_padding=training_config.get("mask_padding", False),
+                mask_padding_dropout=training_config.get("mask_padding_dropout", 0.0),
+                pre_encoded=training_config.get("pre_encoded", True),
             )
 
 

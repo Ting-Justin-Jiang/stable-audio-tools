@@ -1,6 +1,8 @@
 import argparse
 import json
 import importlib.util
+import os
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Union
 from functools import partial
@@ -11,13 +13,11 @@ import torchaudio
 import numpy as np
 from tqdm import tqdm
 
-# Configure torch.load to disable weights_only for compatibility
 torch.load = partial(torch.load, weights_only=False)
 
 
 class CLAPImplementation(Enum):
     """Available CLAP implementations."""
-    LAION = "laion"
     TRANSFORMERS = "transformers"
 
 
@@ -57,17 +57,19 @@ def load_prompts(cfg_path: Path, truncate_commas: int = 4) -> List[str]:
         meta = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(meta)
 
-        for wav in root.rglob("*.wav"):
-            info: Dict[str, str] = {"relpath": str(wav.relative_to(root))}
-            try:
-                metadata = meta.get_custom_metadata(info, None)
-                prompt = ""
-                if metadata and "prompt" in metadata:
-                    prompt = metadata["prompt"]
-                if prompt:
-                    prompts.append(_truncate_at_commas(prompt, truncate_commas))
-            except Exception as e:
-                print(f"Warning: Error processing {wav}: {e}")
+        audio_exts = [".wav", ".mp3", ".flac", ".ogg", ".m4a"]
+        for ext in audio_exts:
+            for audio_path in root.rglob(f"*{ext}"):
+                info: Dict[str, str] = {"relpath": str(audio_path.relative_to(root))}
+                try:
+                    metadata = meta.get_custom_metadata(info, None)
+                    prompt = ""
+                    if metadata and "prompt" in metadata:
+                        prompt = metadata["prompt"]
+                    if prompt:
+                        prompts.append(_truncate_at_commas(prompt, truncate_commas))
+                except Exception as e:
+                    print(f"Warning: Error processing {audio_path}: {e}")
 
     if not prompts:
         raise RuntimeError("No prompts found – check dataset configuration.")
@@ -75,42 +77,16 @@ def load_prompts(cfg_path: Path, truncate_commas: int = 4) -> List[str]:
 
 
 class CLAPEvaluator:
-    """Unified CLAP evaluator supporting multiple implementations."""
-    
-    def __init__(self, 
-                 implementation: CLAPImplementation,
+    """CLAP evaluator using HuggingFace Transformers implementation."""
+
+    def __init__(self,
                  model_path: Optional[str] = None,
                  device: str = "cuda"):
-        self.implementation = implementation
         self.device = device
         self.model = None
         self.processor = None
-        
-        if implementation == CLAPImplementation.LAION:
-            self._init_laion_clap(model_path)
-        elif implementation == CLAPImplementation.TRANSFORMERS:
-            self._init_transformers_clap(model_path)
-        else:
-            raise ValueError(f"Unsupported implementation: {implementation}")
-    
-    def _init_laion_clap(self, model_path: Optional[str]) -> None:
-        """Initialize LAION CLAP implementation."""
-        try:
-            import laion_clap
-        except ImportError:
-            raise ImportError("laion-clap not installed. Install with: pip install laion-clap")
-        
-        self.model = laion_clap.CLAP_Module(enable_fusion=False)
-        self.model = self.model.eval().to(self.device)
-        
-        if model_path and Path(model_path).exists():
-            print(f"Loading LAION CLAP checkpoint from {model_path}")
-            clap_state = torch.load(model_path, map_location=self.device)
-            self.model.model.load_state_dict(clap_state, strict=False)
-        else:
-            print("Loading default LAION CLAP checkpoint")
-            self.model.load_ckpt()
-    
+        self._init_transformers_clap(model_path)
+
     def _init_transformers_clap(self, model_path: Optional[str]) -> None:
         """Initialize HuggingFace Transformers CLAP implementation."""
         try:
@@ -122,79 +98,52 @@ class CLAPEvaluator:
         print(f"Loading Transformers CLAP model: {model_name}")
         
         self.model = ClapModel.from_pretrained(model_name).to(self.device)
+        self.model.eval()
         self.processor = ClapProcessor.from_pretrained(model_name)
-    
-    def get_embeddings(self, 
-                      audio: torch.Tensor, 
-                      prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get audio and text embeddings using the appropriate implementation."""
-        if self.implementation == CLAPImplementation.LAION:
-            return self._get_laion_embeddings(audio, prompts)
-        elif self.implementation == CLAPImplementation.TRANSFORMERS:
-            return self._get_transformers_embeddings(audio, prompts)
-        else:
-            raise ValueError(f"Unsupported implementation: {self.implementation}")
-    
-    def _get_laion_embeddings(self, 
-                            audio: torch.Tensor, 
-                            prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get embeddings using LAION CLAP."""
-        if self.model is None:
-            raise RuntimeError("LAION CLAP model not initialized")
-            
-        if audio.is_cuda:
-            audio = audio.cpu()
-        
-        with torch.no_grad():
-            # LAION CLAP expects audio as numpy for get_audio_embedding_from_data
-            audio_np = audio.numpy()
-            audio_embedding = self.model.get_audio_embedding_from_data(x=audio_np, use_tensor=True)
-            text_embedding = self.model.get_text_embedding(prompts, use_tensor=True)
-            
-        return audio_embedding.to(self.device), text_embedding.to(self.device)
-    
-    def _get_transformers_embeddings(self, 
-                                   audio: torch.Tensor, 
-                                   prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    def get_embeddings(self,
+                       audio: torch.Tensor,
+                       prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get audio and text embeddings (Transformers)."""
+        return self._get_transformers_embeddings(audio, prompts)
+
+    def _get_transformers_embeddings(self,
+                                     audio: torch.Tensor,
+                                     prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get embeddings using HuggingFace Transformers CLAP."""
         if self.model is None or self.processor is None:
             raise RuntimeError("Transformers CLAP model not initialized")
-            
+        
         with torch.no_grad():
-            # Process audio - need to handle batch of audio
             audio_list = [audio[i].cpu().numpy() for i in range(audio.shape[0])]
             audio_inputs = self.processor(
-                audios=audio_list, 
-                return_tensors="pt", 
+                audios=audio_list,
+                return_tensors="pt",
                 sampling_rate=48000
             )
-            
-            # Move audio inputs to device
+
             for key in audio_inputs:
                 if isinstance(audio_inputs[key], torch.Tensor):
                     audio_inputs[key] = audio_inputs[key].to(self.device)
-            
-            # Process text
+
             text_inputs = self.processor(
-                text=prompts, 
-                return_tensors="pt", 
+                text=prompts,
+                return_tensors="pt",
                 padding=True
             )
-            
-            # Move text inputs to device
+
             for key in text_inputs:
                 if isinstance(text_inputs[key], torch.Tensor):
                     text_inputs[key] = text_inputs[key].to(self.device)
-            
-            # Get embeddings
+
             audio_embedding = self.model.get_audio_features(**audio_inputs)
             text_embedding = self.model.get_text_features(**text_inputs)
-            
+
         return audio_embedding, text_embedding
 
 
-def evaluate_clap_quality(evaluator: CLAPEvaluator, 
-                         audio: torch.Tensor, 
+def evaluate_clap_quality(evaluator: CLAPEvaluator,
+                         audio: torch.Tensor,
                          prompts: List[str]) -> float:
     """Evaluate CLAP quality score for audio-text pairs."""
     audio_embedding, text_embedding = evaluator.get_embeddings(audio, prompts)
@@ -209,7 +158,7 @@ def evaluate_clap_quality(evaluator: CLAPEvaluator,
 
 def evaluate_clap_diversity(evaluator: CLAPEvaluator,
                            prompt: str,
-                           model, 
+                           model,
                            model_config: Dict[str, Any],
                            num_samples: int = 5,
                            **generation_kwargs) -> float:
@@ -234,7 +183,7 @@ def evaluate_clap_diversity(evaluator: CLAPEvaluator,
                 steps=generation_kwargs.get("steps", 8),
                 conditioning=conditioning,
                 sample_size=sample_size,
-                seed=generation_kwargs.get("seed", 42) + i,  # Different seed for each sample
+                seed=generation_kwargs.get("seed", 42) + i,  # Different seed per sample
                 device=generation_kwargs.get("device", "cuda"),
             )
             audio_samples.append(audio.squeeze(0).mean(dim=0))  # Convert to mono and remove batch dim
@@ -267,35 +216,115 @@ def evaluate_clap_diversity(evaluator: CLAPEvaluator,
     return diversity_score
 
 
+def set_global_seed(seed: int, deterministic: bool = True) -> None:
+    """Set seeds for Python, NumPy, and PyTorch. Enable deterministic algorithms."""
+    try:
+        import random
+        random.seed(seed)
+    except Exception:
+        pass
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    if deterministic:
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+
+def save_results_json(out_dir: Path,
+                      run_name: Optional[str],
+                      results: Dict[str, Any],
+                      meta: Dict[str, Any]) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name_parts = ["clap_eval"] + ([run_name] if run_name else [])
+    filename = f"{'_'.join(name_parts)}_{timestamp}.json"
+    payload = {"results": results, "meta": meta}
+    path = out_dir / filename
+    path.write_text(json.dumps(payload, indent=2))
+    return path
+
+
+def _slugify_filename(text: str, max_len: int = 64) -> str:
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    text = text.replace(" ", "_")
+    slug = "".join(ch for ch in text if ch in allowed)
+    return slug[:max_len] or "sample"
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate audio generation with CLAP scores")
-    parser.add_argument("--model-config", default="/home/tj147/stable-audio-tools/checkpoint/stable-audio-open-small-base/model_config.json",
-                        help="Path to model configuration file")
-    parser.add_argument("--model-ckpt", default="/home/tj147/stable-audio-tools/checkpoint/stable-audio-open-small-base/model.ckpt",
-                        help="Path to model checkpoint file")
-    parser.add_argument("--clap-implementation", choices=["laion", "transformers"], default="transformers", # laion one has bug
-                        help="CLAP implementation to use")
-    parser.add_argument("--clap-model", default=None,
-                        help="Path to CLAP checkpoint (LAION) or model name (Transformers)")
-    parser.add_argument("--dataset-config", default="./stable_audio_tools/data/local/dataset_cfg.json",
-                        help="Path to dataset configuration file")
-    parser.add_argument("--steps", type=int, default=8, help="Number of diffusion steps")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for evaluation")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate generative audio with CLAP (Transformers). Computes fidelity (CLAP score) "
+            "and diversity across multiple generations per prompt."
+        )
+    )
+
+    # Model
+    parser.add_argument(
+        "--model-config",
+        default="/home/tj147/stable-audio-tools/checkpoint/stable-audio-open-small-base/model_config.json",
+        help="Path to model configuration JSON",
+    )
+    parser.add_argument(
+        "--model-ckpt",
+        default="/home/tj147/stable-audio-tools/checkpoint/stable-audio-open-small-base/model.ckpt",
+        help="Path to model checkpoint",
+    )
+
+    # CLAP (Transformers)
+    parser.add_argument(
+        "--clap-model",
+        default="laion/larger_clap_music_and_speech",
+        help="HuggingFace model id for CLAP",
+    )
+
+    # Data / prompts
+    parser.add_argument(
+        "--dataset-config",
+        default="./stable_audio_tools/data/local/dataset_cfg.json",
+        help="Path to dataset configuration JSON (audio_dir)",
+    )
+    parser.add_argument(
+        "--max-prompts",
+        type=int,
+        default=10,
+        help="Maximum number of prompts to evaluate",
+    )
+
+    # Generation
+    parser.add_argument("--steps", type=int, default=50, help="Number of diffusion steps")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size for quality evaluation")
     parser.add_argument("--seconds-total", type=int, default=11, help="Length of generated audio in seconds")
+    parser.add_argument("--seed", type=int, default=42, help="Base random seed")
+    parser.add_argument("--deterministic", type=int, choices=[0, 1], default=1, help="Enable deterministic algorithms")
     parser.add_argument("--device", default="cuda", help="Device to use (cuda/cpu)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--evaluate-quality", action="store_true", default=False,
-                        help="Evaluate quality (CLAP score)")
-    parser.add_argument("--evaluate-diversity", action="store_true", default=True,
-                        help="Evaluate diversity (requires multiple generations)")
-    parser.add_argument("--diversity-samples", type=int, default=5,
-                        help="Number of samples per prompt for diversity evaluation")
-    parser.add_argument("--max-prompts", type=int, default=10,
-                        help="Maximum number of prompts to evaluate")
-    
+
+    # Metrics
+    parser.add_argument("--evaluate-quality", action="store_true", default=True, help="Compute fidelity (CLAP score)")
+    parser.add_argument("--evaluate-diversity", action="store_true", default=True, help="Compute diversity per prompt")
+    parser.add_argument("--diversity-samples", type=int, default=10, help="Samples per prompt for diversity evaluation")
+
+    # Output
+    parser.add_argument("--out-dir", default="./eval_runs", help="Directory to write results JSON")
+    parser.add_argument("--run-name", default="", help="Optional run name to include in filename")
+    parser.add_argument("--quality-out-name", default="test", help="Folder name under out-dir to save per-prompt audio")
+
     args = parser.parse_args()
 
     # Setup device
+    # Seed and device
+    set_global_seed(int(args.seed), deterministic=bool(args.deterministic))
     device = torch.device("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -318,9 +347,7 @@ def main() -> None:
         raise RuntimeError("Failed to load model configuration")
 
     # Initialize CLAP evaluator
-    clap_impl = CLAPImplementation.LAION if args.clap_implementation == "laion" else CLAPImplementation.TRANSFORMERS
     clap_evaluator = CLAPEvaluator(
-        implementation=clap_impl,
         model_path=args.clap_model,
         device=str(device)
     )
@@ -332,7 +359,7 @@ def main() -> None:
     print(f"Loaded {len(prompts)} prompts for evaluation")
 
     # Evaluation
-    results = {}
+    results: Dict[str, Any] = {}
     
     if args.evaluate_quality:
         print("\n=== QUALITY EVALUATION ===")
@@ -343,28 +370,41 @@ def main() -> None:
         sample_rate = model_config["sample_rate"]
         sample_size = model_config["sample_size"]
         
+        # Prepare output directory for per-prompt audio if requested
+        quality_audio_dir: Optional[Path] = None
+        if args.quality_out_name:
+            base_dir = Path(args.out_dir).expanduser().resolve()
+            quality_audio_dir = base_dir / args.quality_out_name
+            quality_audio_dir.mkdir(parents=True, exist_ok=True)
+        
         for i in tqdm(range(0, len(prompts), args.batch_size), desc="Evaluating Quality"):
-            batch_prompts = prompts[i : i + args.batch_size]
+            batch_prompts = prompts[i: i + args.batch_size]
             batch_size = len(batch_prompts)
-            
-            # Generate audio for each prompt individually
+
             batch_audio = []
-            for prompt in batch_prompts:
+            for j, prompt in enumerate(batch_prompts):
                 conditioning_dict = {"prompt": prompt, "seconds_total": args.seconds_total}
-                conditioning = [conditioning_dict]  # Must be a list of dictionaries
-                
+                conditioning = [conditioning_dict]
+
                 with torch.no_grad():
                     audio = generate_diffusion_cond(
                         model=model,
                         steps=args.steps,
                         conditioning=conditioning,
                         sample_size=sample_size,
-                        seed=args.seed + i,
+                        seed=int(args.seed) + i + j,
                         device=str(device),
                     )
-                    batch_audio.append(audio.squeeze(0).mean(dim=0))  # Convert to mono, remove batch dim
-            
-            # Stack all audio in batch
+                    mono_audio = audio.squeeze(0).mean(dim=0)
+                    batch_audio.append(mono_audio)
+
+                    if quality_audio_dir is not None:
+                        slug = _slugify_filename(prompt)
+                        idx = i + j
+                        wav_path = quality_audio_dir / f"{idx:05d}_{slug}.wav"
+                        wav = mono_audio.detach().cpu().unsqueeze(0)
+                        torchaudio.save(str(wav_path), wav, sample_rate)
+
             batch_audio = torch.stack(batch_audio, dim=0)
             
             # Resample if necessary
@@ -382,7 +422,7 @@ def main() -> None:
     
     if args.evaluate_diversity:
         print(f"\n=== DIVERSITY EVALUATION ===")
-        diversity_scores = []
+        diversity_scores: List[float] = []
         
         # Select subset of prompts for diversity evaluation (it's more expensive)
         diversity_prompts = prompts[:min(10, len(prompts))]
@@ -401,7 +441,7 @@ def main() -> None:
             )
             diversity_scores.append(diversity_score)
         
-        average_diversity = np.mean(diversity_scores)
+        average_diversity = float(np.mean(diversity_scores))
         results["diversity_score"] = average_diversity
         print(f"Average Diversity Score: {average_diversity:.4f}")
     
@@ -409,6 +449,32 @@ def main() -> None:
     print(f"\n=== FINAL RESULTS ===")
     for metric, score in results.items():
         print(f"{metric}: {score:.4f}")
+
+    # Save results JSON with datetime
+    out_dir = Path(args.out_dir).expanduser().resolve()
+    meta: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "device": str(device),
+        "seed": int(args.seed),
+        "deterministic": bool(args.deterministic),
+        "model_config_path": str(Path(args.model_config).expanduser().resolve()),
+        "model_ckpt_path": str(Path(args.model_ckpt).expanduser().resolve()),
+        "clap_model": args.clap_model,
+        "sample_rate": model_config.get("sample_rate"),
+        "sample_size": model_config.get("sample_size"),
+        "seconds_total": int(args.seconds_total),
+        "steps": int(args.steps),
+        "max_prompts": int(args.max_prompts),
+        "num_diversity_samples": int(args.diversity_samples) if args.evaluate_diversity else 0,
+        "library_versions": {
+            "torch": torch.__version__,
+            "torchaudio": getattr(torchaudio, "__version__", "unknown"),
+        },
+    }
+    if args.evaluate_quality and args.quality_out_name:
+        meta["quality_audio_dir"] = str(Path(args.out_dir).expanduser().resolve() / args.quality_out_name)
+    results_path = save_results_json(out_dir, args.run_name or None, results, meta)
+    print(f"Results saved to: {results_path}")
 
 
 if __name__ == "__main__":

@@ -795,6 +795,152 @@ class DiffusionCondDemoCallback(pl.Callback):
             torch.cuda.empty_cache()
             module.train()
 
+class DiffusionCondCLAPEvalCallback(pl.Callback):
+    def __init__(
+        self,
+        eval_dl,
+        eval_every: int = 2000,
+        steps: int = 50,
+        sample_size: int = 65536,
+        sample_rate: int = 48000,
+        num_eval: int = 8,
+        clap_model_id: str = "laion/larger_clap_music_and_speech",
+    ):
+        super().__init__()
+        self.eval_dl = iter(eval_dl)
+        self.eval_every = int(eval_every)
+        self.steps = int(steps)
+        self.sample_size = int(sample_size)
+        self.sample_rate = int(sample_rate)
+        self.num_eval = int(num_eval)
+        self.clap_model_id = clap_model_id
+        self._clap = None
+        self._last_eval_step = -1
+
+    def _ensure_clap(self, device: str):
+        if self._clap is None:
+            from eval import CLAPEvaluator
+            self._clap = CLAPEvaluator(model_path=self.clap_model_id, device=device)
+
+    def _load_reference_audio(self, md_list, target_sr: int, length_samples: int):
+        import torchaudio
+        refs = []
+        paths_used = 0
+        for md in md_list:
+            path = md.get("path") or None
+            if path is None:
+                refs.append(None)
+                continue
+            try:
+                wav, sr = torchaudio.load(path)
+                if sr != target_sr:
+                    wav = torchaudio.functional.resample(wav, sr, target_sr)
+                # stereo->mono
+                wav = wav.mean(dim=0, keepdim=False)
+                # try to align to recorded start index if present
+                seconds_start = float(md.get("seconds_start", 0))
+                start = int(seconds_start * target_sr)
+                end = start + length_samples
+                if wav.numel() < end:
+                    # pad if too short
+                    pad_amount = end - wav.numel()
+                    wav = torch.nn.functional.pad(wav, (0, pad_amount))
+                wav = wav[start:end]
+                refs.append(wav)
+                paths_used += 1
+            except Exception:
+                refs.append(None)
+        if paths_used == 0:
+            return None
+        # stack available; drop Nones
+        valid = [w for w in refs if w is not None]
+        if not valid:
+            return None
+        return torch.stack(valid, dim=0)
+
+    @rank_zero_only
+    @torch.no_grad()
+    def on_train_batch_end(self, trainer, module: DiffusionCondTrainingWrapper, outputs, batch, batch_idx):
+        if self.eval_every <= 0:
+            return
+        if (trainer.global_step - 1) % self.eval_every != 0 or self._last_eval_step == trainer.global_step:
+            return
+
+        self._last_eval_step = trainer.global_step
+        module.eval()
+
+        try:
+            # pull a batch
+            reals, metadata = next(self.eval_dl)
+            if reals.ndim == 4 and reals.shape[0] == 1:
+                reals = reals[0]
+            # trim to num_eval
+            metadata = metadata[: self.num_eval]
+
+            # Build prompts
+            prompts = []
+            for md in metadata:
+                prompt = md.get("prompt") or md.get("text") or ""
+                prompts.append(str(prompt))
+
+            # conditioning dicts
+            cond_list = []
+            seconds_total = float(self.sample_size / self.sample_rate)
+            for md, p in zip(metadata, prompts):
+                cond_list.append({
+                    "prompt": p,
+                    "seconds_total": float(md.get("seconds_total", seconds_total))
+                })
+
+            # Generate audio with EMA weights if present
+            from stable_audio_tools.inference.generation import generate_diffusion_cond
+
+            wrapper = module.diffusion
+            original_model = wrapper.model
+            if module.diffusion_ema is not None and module.diffusion_ema.ema_model is not None:
+                wrapper.model = module.diffusion_ema.ema_model
+            try:
+                audio = generate_diffusion_cond(
+                    model=wrapper,
+                    steps=self.steps,
+                    conditioning=cond_list,
+                    batch_size=len(cond_list),
+                    sample_size=self.sample_size,
+                    seed=42 + trainer.global_step,
+                    device=str(module.device),
+                )
+            finally:
+                wrapper.model = original_model
+
+            # mono [B,T]
+            gen_audio = audio.squeeze(1) if audio.dim() == 3 and audio.shape[1] == 1 else audio.mean(dim=1)
+
+            # CLAP evaluator and score
+            self._ensure_clap(str(module.device))
+            clap_batch_score = evaluate_clap_quality(self._clap, gen_audio, prompts)
+            clap_avg = float(clap_batch_score / len(prompts)) if len(prompts) > 0 else 0.0
+
+            # Reference audio for FAD
+            ref_audio = self._load_reference_audio(metadata, target_sr=module.diffusion.sample_rate, length_samples=self.sample_size)
+            fad_value = None
+            if ref_audio is not None:
+                # resample to 48k happens in compute_clap_fad
+                fad_value = compute_clap_fad(self._clap, ref_audio, gen_audio, sample_rate=module.diffusion.sample_rate)
+
+            # Log
+            step = trainer.global_step
+            log_metric(trainer.logger, "eval/clap_score", clap_avg, step=step)
+            if fad_value is not None:
+                log_metric(trainer.logger, "eval/fad", float(fad_value), step=step)
+        except StopIteration:
+            pass
+        except Exception as e:
+            print(f"CLAP Eval error: {type(e).__name__}: {e}")
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
+            module.train()
+
 class DiffusionCondInpaintDemoCallback(pl.Callback):
     def __init__(
         self,

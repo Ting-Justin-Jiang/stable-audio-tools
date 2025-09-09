@@ -1,7 +1,16 @@
 import argparse
 import json
+import torch
 from torch.nn.parameter import Parameter
+from stable_audio_tools.training.factory import create_training_wrapper_from_config
 from stable_audio_tools.models import create_model_from_config
+
+_torch_load = torch.load
+def _torch_load_compat(*args, **kwargs):
+    if "weights_only" not in kwargs:
+        kwargs["weights_only"] = False
+    return _torch_load(*args, **kwargs)
+torch.load = _torch_load_compat
 
 if __name__ == '__main__':
     args = argparse.ArgumentParser()
@@ -23,87 +32,18 @@ if __name__ == '__main__':
 
     training_config = model_config.get('training', None)
 
-    if model_type == 'autoencoder':
-        from stable_audio_tools.training.autoencoders import AutoencoderTrainingWrapper
-        
-        ema_copy = None
+    # Always build the correct training wrapper from the config, then load the checkpoint's state_dict
+    assert args.ckpt_path is not None, 'ckpt-path must be provided'
+    training_wrapper = create_training_wrapper_from_config(model_config, model)
 
-        if training_config.get("use_ema", False):
-            from stable_audio_tools.models.factory import create_model_from_config
-            ema_copy = create_model_from_config(model_config)
-            ema_copy = create_model_from_config(model_config) # I don't know why this needs to be called twice but it broke when I called it once
-        
-            # Copy each weight to the ema copy
-            for name, param in model.state_dict().items():
-                if isinstance(param, Parameter):
-                    # backwards compatibility for serialized parameters
-                    param = param.data
-                ema_copy.state_dict()[name].copy_(param)
-
-        use_ema = training_config.get("use_ema", False)
-
-        training_wrapper = AutoencoderTrainingWrapper.load_from_checkpoint(
-            args.ckpt_path, 
-            autoencoder=model, 
-            strict=False,
-            loss_config=training_config["loss_configs"],
-            use_ema=training_config["use_ema"],
-            ema_copy=ema_copy if use_ema else None
-        )
-    elif model_type == 'diffusion_uncond':
-        from stable_audio_tools.training.diffusion import DiffusionUncondTrainingWrapper
-        training_wrapper = DiffusionUncondTrainingWrapper.load_from_checkpoint(args.ckpt_path, model=model, strict=False)
-
-    elif model_type == 'diffusion_autoencoder':
-        from stable_audio_tools.training.diffusion import DiffusionAutoencoderTrainingWrapper
-
-        ema_copy = create_model_from_config(model_config)
-        
-        for name, param in model.state_dict().items():
-            if isinstance(param, Parameter):
-                # backwards compatibility for serialized parameters
-                param = param.data
-            ema_copy.state_dict()[name].copy_(param)
-
-        training_wrapper = DiffusionAutoencoderTrainingWrapper.load_from_checkpoint(args.ckpt_path, model=model, ema_copy=ema_copy, strict=False)
-    elif model_type in ['diffusion_cond', 'diffusion_cond_inpaint']:
-        from stable_audio_tools.training.diffusion import DiffusionCondTrainingWrapper
-        
-        use_ema = training_config.get("use_ema", True)
-        
-        training_wrapper = DiffusionCondTrainingWrapper.load_from_checkpoint(
-            args.ckpt_path, 
-            model=model, 
-            use_ema=use_ema, 
-            lr=training_config.get("learning_rate", None),
-            optimizer_configs=training_config.get("optimizer_configs", None),
-            strict=False
-        )
-    elif model_type == 'lm':
-        from stable_audio_tools.training.lm import AudioLanguageModelTrainingWrapper
-
-        ema_copy = None
-
-        if training_config.get("use_ema", False):
-
-            ema_copy = create_model_from_config(model_config)
-
-            for name, param in model.state_dict().items():
-                if isinstance(param, Parameter):
-                    # backwards compatibility for serialized parameters
-                    param = param.data
-                ema_copy.state_dict()[name].copy_(param)
-
-        training_wrapper = AudioLanguageModelTrainingWrapper.load_from_checkpoint(
-            args.ckpt_path, 
-            model=model, 
-            strict=False, 
-            ema_copy=ema_copy,
-            optimizer_configs=training_config.get("optimizer_configs", None)
-        )
-
+    if args.ckpt_path.endswith('.safetensors'):
+        from safetensors.torch import load_file as safe_load_file
+        state_dict = safe_load_file(args.ckpt_path)
     else:
-        raise ValueError(f"Unknown model type {model_type}")
+        ckpt_obj = torch.load(args.ckpt_path)
+        state_dict = ckpt_obj.get('state_dict', ckpt_obj)
+
+    training_wrapper.load_state_dict(state_dict, strict=False)
     
     print(f"Loaded model from {args.ckpt_path}")
 

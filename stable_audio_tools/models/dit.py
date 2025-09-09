@@ -27,11 +27,19 @@ class DiffusionTransformer(nn.Module):
         timestep_cond_type: tp.Literal["global", "input_concat"] = "global",
         timestep_embed_dim=None,
         diffusion_objective: tp.Literal["v", "rectified_flow", "rf_denoiser"] = "v",
+
+        # SRA parameters
+        sra_enabled: bool = False,
+        sra_student_layer: int = 8,
+        sra_teacher_layer: int = 14,
         **kwargs):
 
         super().__init__()
         
         self.cond_token_dim = cond_token_dim
+        self.sra_enabled = sra_enabled
+        self.sra_student_layer = sra_student_layer
+        self.sra_teacher_layer = sra_teacher_layer
 
         # Timestep embeddings
         self.timestep_cond_type = timestep_cond_type
@@ -122,6 +130,22 @@ class DiffusionTransformer(nn.Module):
         self.postprocess_conv = nn.Conv1d(io_channels, io_channels, 1, bias=False)
         nn.init.zeros_(self.postprocess_conv.weight)
 
+        # SRA learnable head for student representation
+        if self.sra_enabled:
+            self.sra_student_head = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim * 2),
+                nn.SiLU(),
+                nn.Linear(embed_dim * 2, embed_dim * 2),
+                nn.SiLU(),
+                nn.Linear(embed_dim * 2, embed_dim)
+            )
+
+            # Initialize the student head with small weights
+            for layer in self.sra_student_head:
+                if isinstance(layer, nn.Linear):
+                    nn.init.normal_(layer.weight, std=0.02)
+                    nn.init.zeros_(layer.bias)
+
     def _forward(
         self, 
         x, 
@@ -135,6 +159,7 @@ class DiffusionTransformer(nn.Module):
         prepend_cond_mask=None,
         return_info=False,
         exit_layer_ix=None,
+        sra_extract_layer=None,
         **kwargs):
 
         if cross_attn_cond is not None:
@@ -186,7 +211,8 @@ class DiffusionTransformer(nn.Module):
             else:
                 # Prepend inputs are the prepend conditioning + the global embed
                 prepend_inputs = torch.cat([prepend_inputs, global_embed.unsqueeze(1)], dim=1)
-                prepend_mask = torch.cat([prepend_mask, torch.ones((x.shape[0], 1), device=x.device, dtype=torch.bool)], dim=1)
+                if prepend_mask is not None:
+                    prepend_mask = torch.cat([prepend_mask, torch.ones((x.shape[0], 1), device=x.device, dtype=torch.bool)], dim=1)
 
             prepend_length = prepend_inputs.shape[1]
 
@@ -203,19 +229,66 @@ class DiffusionTransformer(nn.Module):
             x = rearrange(x, "b (t p) c -> b t (c p)", p=self.patch_size)
 
         if self.transformer_type == "continuous_transformer":
+            # For SRA, we need to get hidden states to extract representations
+            need_hidden_states = sra_extract_layer is not None
+            actual_return_info = return_info or need_hidden_states
+            
             # Masks not currently implemented for continuous transformer
-            output = self.transformer(x, prepend_embeds=prepend_inputs, context=cross_attn_cond, return_info=return_info, exit_layer_ix=exit_layer_ix, **extra_args, **kwargs)
+            output = self.transformer(
+                x, 
+                prepend_embeds=prepend_inputs, 
+                context=cross_attn_cond, 
+                return_info=actual_return_info, 
+                exit_layer_ix=exit_layer_ix, 
+                **extra_args, 
+                **kwargs
+            )
 
-            if return_info:
+            if actual_return_info:
                 output, info = output
+            else:
+                info = None
 
-            # Avoid postprocessing on early exit
+            # Handle early exit for teacher representation (no postprocessing)
             if exit_layer_ix is not None:
+                # Remove memory tokens if they exist
+                output = output[:, self.transformer.num_memory_tokens:, :]
+                
+                if sra_extract_layer is not None:
+                    # This should not happen - exit_layer_ix and sra_extract_layer shouldn't be used together
+                    raise ValueError("Cannot use both exit_layer_ix and sra_extract_layer simultaneously")
+                
                 if return_info:
                     return output, info
                 else:
                     return output
 
+        # Handle SRA representation extraction
+        sra_repr = None
+        if sra_extract_layer is not None and info is not None:
+            if "hidden_states" in info and len(info["hidden_states"]) > sra_extract_layer:
+                # Extract representation at the specified layer
+                layer_repr = info["hidden_states"][sra_extract_layer]
+                # Remove memory tokens if they exist
+                layer_repr = layer_repr[:, self.transformer.num_memory_tokens:, :]
+                # Exclude prepend tokens from alignment; keep only audio tokens
+                if prepend_length > 0:
+                    layer_repr = layer_repr[:, prepend_length:, :]
+                
+                # Apply student head if this is for student representation
+                if self.sra_enabled and hasattr(self, 'sra_student_head'):
+                    if sra_extract_layer == self.sra_student_layer:
+                        sra_repr = self.sra_student_head(layer_repr)
+                    else:
+                        # For teacher representation, use raw layer output
+                        sra_repr = layer_repr
+                else:
+                    sra_repr = layer_repr
+
+                # Normalize representations for stable SRA alignment (per-token LayerNorm)
+                sra_repr = F.layer_norm(sra_repr, sra_repr.shape[-1:])
+
+        # Continue with normal postprocessing
         output = rearrange(output, "b t c -> b c t")[:,:,prepend_length:]
 
         if self.patch_size > 1:
@@ -223,10 +296,17 @@ class DiffusionTransformer(nn.Module):
 
         output = self.postprocess_conv(output) + output
 
-        if return_info:
-            return output, info
-
-        return output
+        # Return based on what was requested
+        if sra_extract_layer is not None:
+            if return_info:
+                return output, sra_repr, info
+            else:
+                return output, sra_repr
+        else:
+            if return_info:
+                return output, info
+            else:
+                return output
 
     def forward(
         self, 
@@ -249,6 +329,7 @@ class DiffusionTransformer(nn.Module):
         mask=None,
         return_info=False,
         exit_layer_ix=None,
+        sra_extract_layer=None,
         **kwargs):
 
         assert causal == False, "Causal mode is not supported for DiffusionTransformer"
@@ -300,6 +381,25 @@ class DiffusionTransformer(nn.Module):
                 mask=mask,
                 return_info=return_info,
                 exit_layer_ix=exit_layer_ix,
+                sra_extract_layer=sra_extract_layer,
+                **kwargs
+            )
+
+        # SRA extraction also bypasses CFG processing for simplicity
+        if sra_extract_layer is not None:
+            assert self.transformer_type == "continuous_transformer", "sra_extract_layer is only supported for continuous_transformer"
+            return self._forward(
+                x,
+                t,
+                cross_attn_cond=cross_attn_cond, 
+                cross_attn_cond_mask=cross_attn_cond_mask, 
+                input_concat_cond=input_concat_cond, 
+                global_embed=global_embed, 
+                prepend_cond=prepend_cond, 
+                prepend_cond_mask=prepend_cond_mask,
+                mask=mask,
+                return_info=return_info,
+                sra_extract_layer=sra_extract_layer,
                 **kwargs
             )
 
@@ -395,9 +495,16 @@ class DiffusionTransformer(nn.Module):
                 **kwargs)
 
             if return_info:
-                batch_output, info = batch_output
-
-            cond_output, uncond_output = torch.chunk(batch_output, 2, dim=0)
+                batch_output_tensor, info = batch_output
+            else:
+                batch_output_tensor = batch_output
+                info = None
+                
+            # Ensure batch_output_tensor is a tensor for chunking
+            if isinstance(batch_output_tensor, tuple):
+                batch_output_tensor = batch_output_tensor[0]
+                
+            cond_output, uncond_output = torch.chunk(batch_output_tensor, 2, dim=0)
 
             cfg_output = uncond_output + (cond_output - uncond_output) * cfg_scale
 
@@ -410,6 +517,8 @@ class DiffusionTransformer(nn.Module):
                 output = cfg_output
            
             if return_info:
+                if info is None:
+                    info = {}
                 info["uncond_output"] = uncond_output
                 return output, info
 

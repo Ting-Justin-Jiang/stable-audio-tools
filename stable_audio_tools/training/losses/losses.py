@@ -5,6 +5,27 @@ from torch.nn import functional as F
 from torch import nn
 from .utils import mmd
 
+def charbonnier_weight(delta: torch.Tensor, c0: float = 1.0, c: float = 0.02) -> torch.Tensor:
+    """
+    Compute Charbonnier-style per-sample weights for a residual tensor.
+
+    Args:
+        delta: Residual tensor of shape [B, ...]. The mean-square is reduced over non-batch dims.
+        c0: Scaling constant (default: 1.0).
+        c: Small constant to stabilize gradients (default: 0.02).
+
+    Returns:
+        Tensor of shape [B] containing weights for each sample in the batch.
+    """
+    assert delta.ndim >= 1, "delta must have batch dimension"
+    if delta.ndim == 1:
+        mse_per_sample = delta.pow(2)
+    else:
+        reduce_dims = tuple(range(1, delta.ndim))
+        mse_per_sample = delta.pow(2).mean(dim=reduce_dims)
+    denom = torch.sqrt(mse_per_sample + (c ** 2))
+    return c0 / denom
+
 class LossModule(nn.Module):
     def __init__(self, name: str, weight: float = 1.0, decay = 1.0):
         super().__init__()

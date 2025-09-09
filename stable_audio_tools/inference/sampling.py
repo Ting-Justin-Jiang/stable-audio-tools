@@ -103,7 +103,6 @@ def sample_discrete_euler(model, x, steps=None, sigma_max=1, sigmas=None, callba
     ts = x.new_ones([x.shape[0]])
 
     if sigmas is None:
-
         # Create the noise schedule
         t = torch.linspace(sigma_max, 0, steps + 1)
 

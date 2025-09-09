@@ -177,7 +177,7 @@ if __name__ == "__main__":
     parser.add_argument('--model-half', action='store_true', help='Whether to use half precision')
     parser.add_argument('--dataset-config', type=str, help='Path to dataset config file', required=True)
     parser.add_argument('--output-path', type=str, help='Path to output folder', required=True)
-    parser.add_argument('--batch-size', type=int, help='Batch size', default=1)
+    parser.add_argument('--batch-size', type=int, help='Batch size', default=32)
     parser.add_argument('--sample-size', type=int, help='Number of audio samples to pad/crop to', default=1320960)
     parser.add_argument('--is-discrete', action='store_true', help='Whether the model is discrete')
     parser.add_argument('--num-nodes', type=int, help='Number of GPU nodes', default=1)

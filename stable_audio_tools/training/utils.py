@@ -4,6 +4,8 @@ from ..interface.aeiou import pca_point_cloud
 import wandb
 import torch
 import os
+import re
+import typing as tp
 
 def get_rank():
     """Get rank of current process."""
@@ -127,3 +129,64 @@ def log_point_cloud(logger, key, tokens, caption=None):
     elif isinstance(logger, CometLogger):
         point_cloud = pca_point_cloud(tokens, rgb_float=True, output_type="points")
         #logger.experiment.log_points_3d(scene_name=key, points=point_cloud)
+
+def regex_any_match(name: str, patterns: tp.Sequence[str]) -> bool:
+    """
+    Return True if parameter name matches any provided regex pattern.
+    """
+    for pattern in patterns:
+        if re.search(pattern, name) is not None:
+            return True
+    return False
+
+def sample_pair_indices(K: int, B: int, neighbor_prob: float = 0.7, skip_max: int = 3) -> tp.Tuple[torch.LongTensor, torch.LongTensor]:
+    """
+    Sample index pairs (t_idx, r_idx) such that 0 <= r_idx < t_idx < K.
+
+    Strategy:
+      - Choose t_idx uniformly from {1..K-1} (since r must be < t).
+      - Choose gap Δ from categorical with mass on neighbors and small mass on skip pairs,
+        constrained by skip_max and by t_idx.
+
+    Args:
+        K: Number of discrete time steps.
+        B: Batch size.
+        neighbor_prob: Probability mass assigned to Δ=1. Remaining mass spread across 2..skip_max.
+        skip_max: Maximum gap considered when sampling Δ.
+
+    Returns:
+        (t_idx, r_idx): LongTensors of shape [B].
+    """
+    assert K >= 2, "K must be at least 2"
+    assert 0.0 <= neighbor_prob <= 1.0, "neighbor_prob must be in [0,1]"
+    device = torch.device("cpu")
+    t_idx = torch.randint(low=1, high=K, size=(B,), device=device)
+
+    # Build base probabilities for gaps 1..skip_max
+    gaps = torch.arange(1, skip_max + 1, device=device)
+    if skip_max == 1:
+        probs = torch.tensor([1.0], device=device)
+    else:
+        remain = max(0.0, 1.0 - neighbor_prob)
+        # Distribute remaining probability mass geometrically across 2..skip_max
+        tail = torch.linspace(1.0, 0.0, steps=skip_max - 1, device=device)
+        tail = tail / tail.sum() if tail.sum() > 0 else tail
+        probs = torch.cat([
+            torch.tensor([neighbor_prob], device=device),
+            remain * tail
+        ])
+
+    # For each sample, clip Δ by available range (<= t_idx)
+    deltas = torch.empty_like(t_idx)
+    for i in range(B):
+        max_gap = min(int(skip_max), int(t_idx[i].item()))
+        if max_gap == 0:
+            deltas[i] = 1  # Should not happen since t_idx>=1
+            continue
+        local_probs = probs[:max_gap]
+        local_probs = local_probs / local_probs.sum()
+        choice = torch.multinomial(local_probs, num_samples=1)
+        deltas[i] = gaps[choice]
+
+    r_idx = t_idx - deltas
+    return t_idx.long(), r_idx.long()
