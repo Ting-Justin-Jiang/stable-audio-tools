@@ -1,0 +1,137 @@
+{
+  "model_type": "diffusion_cond",
+  "sample_size": 524288,
+  "sample_rate": 44100,
+  "audio_channels": 2,
+  "model": {
+      "pretransform": {
+          "type": "autoencoder",
+          "iterate_batch": false,
+          "model_half": true,
+          "config": {
+              "encoder": {
+                  "type": "oobleck",
+                  "requires_grad": false,
+                  "config": {
+                      "in_channels": 2,
+                      "channels": 128,
+                      "c_mults": [1, 2, 4, 8, 16],
+                      "strides": [2, 4, 4, 8, 8],
+                      "latent_dim": 128,
+                      "use_snake": true
+                  }
+              },
+              "decoder": {
+                  "type": "oobleck",
+                  "config": {
+                      "out_channels": 2,
+                      "channels": 128,
+                      "c_mults": [1, 2, 4, 8, 16],
+                      "strides": [2, 4, 4, 8, 8],
+                      "latent_dim": 64,
+                      "use_snake": true,
+                      "final_tanh": false
+                  }
+              },
+              "bottleneck": {
+                  "type": "vae"
+              },
+              "latent_dim": 64,
+              "downsampling_ratio": 2048,
+              "io_channels": 2
+          }
+      },
+      "conditioning": {
+          "configs": [
+              {
+                  "id": "prompt",
+                  "type": "t5",
+                  "config": {
+                      "t5_model_name": "t5-base",
+                      "max_length": 64
+                  }
+              },
+              {
+                  "id": "seconds_total",
+                  "type": "number",
+                  "config": {
+                      "min_val": 0,
+                      "max_val": 256
+                  }
+              }
+          ],
+          "cond_dim": 768
+      },
+      "diffusion": {
+          "cross_attention_cond_ids": ["prompt", "seconds_total"],
+          "global_cond_ids": ["seconds_total"],
+          "diffusion_objective": "rf_denoiser",
+          "type": "dit",
+          "config": {
+              "io_channels": 64,
+              "embed_dim": 1024,
+              "depth": 16,
+              "num_heads": 8,
+              "cond_token_dim": 768,
+              "global_cond_dim": 768,
+              "transformer_type": "continuous_transformer",
+              "sra_enabled": true,
+              "sra_student_layer": 6,
+              "sra_teacher_layer": 12,
+              "attn_kwargs": {
+                  "qk_norm": "ln"
+              }
+          }
+      },
+      "io_channels": 64
+  },
+  "training": {
+    "use_ema": true,
+    "pre_encoded": true,
+    "log_loss_info": false,
+    "mask_padding_dropout": 0.0,
+    "optimizer_configs": {
+            "diffusion": {
+                "optimizer": {
+                    "type": "AdamW",
+                    "config": {
+                        "lr": 5e-5,
+                        "betas": [0.9, 0.999],
+                        "weight_decay": 1e-3
+                    }
+                },
+                "scheduler": {
+                    "type": "InverseLR",
+                    "config": {
+                        "inv_gamma": 1000000,
+                        "power": 0.5,
+                        "warmup": 0.99
+                    }
+                }
+            }
+    },
+    "a2ct": {
+        "tau_grid_from_solver": {"solver": "pingpong", "K": 8, "sigma_max": 1.0},
+        "pair_sampler": {"neighbor_prob": 0.7, "skip_max": 3},
+        "gate": {"tau_c": 0.6, "tau_delta": 0.1, "use_confidence": false, "confidence_prev_step": 1, "diffusion_tau_gate": 0.5, "diffusion_loss_weight": 0.2},
+        "charbonnier": {"c0": 1.0, "c": 0.02},
+        "sra": {"use": false, "lambda": 0.2, "student_layer": 8, "ema_layer": 14, "prior_layer": 14},
+        "prox": {"use": false, "mu": 0.0003, "param_name_regex": ["time_embed", "pos_embed", "block0", "block1"]},
+        "ema": {"use": true, "beta": 0.9999, "start_step": 0}
+    },
+    "demo": {
+        "demo_every": 64,
+        "demo_steps": 8,
+        "num_demos": 4,
+        "demo_cond": [
+            {"prompt": "jamendo dataset, music clip, piano, violin, orchestral, soundtrack", "seconds_start": 0, "seconds_total": 11},
+            {"prompt": "jamendo dataset, music clip, epic, epicmusic, filmmusic, trailermusic, classical, soundtrack, symphonic", "seconds_start": 0, "seconds_total": 11},
+            {"prompt": "jamendo dataset, music clip, piano, dreamy, melancholy, classical, experimental", "seconds_start": 0, "seconds_total": 11},
+            {"prompt": "jamendo dataset, music clip, orchestra, piano, violins, classical, medieval, soundtrack", "seconds_start": 0, "seconds_total": 11}
+        ],
+        "demo_cfg_scales": [1]
+    }
+  }
+}
+
+
